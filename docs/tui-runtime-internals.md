@@ -89,6 +89,38 @@ The writer:
 
 Viewport-only frames cannot create history. Theme changes leave native history terminal-owned; settled resizes may replay it according to `ResizeScrollbackMode`.
 
+### Unmanaged output isolation
+
+On Unix, `ProcessTerminal.start()` saves stdout and redirects fd 1 plus same-terminal fd 2 to the process log (`getLogPath()`). Bun caches private TTY descriptors in its stdout/stderr streams, so their `write` methods also route to the redirected descriptors while ownership is active. These diagnostic writes complete synchronously; callbacks run in a microtask. Renderer writes still use the native pump. Separately redirected stderr and non-terminal stdout are left untouched. This is protection against accidental output, not a sandbox: code can still deliberately open `/dev/tty` or retain a private terminal writer.
+
+Renderer output remains on the native writer's private terminal descriptor. If that writer is unavailable, the fallback writes the complete UTF-8 buffer through the saved descriptor, retaining ConPTY chunk limits. A private TTY stream refreshes dimensions on SIGWINCH and updates the stdout geometry used by callers.
+
+Stop, external-editor/suspend handoff, and emergency cleanup restore stdout/stderr before releasing terminal ownership. Restart reacquires isolation. If the log cannot be opened or Unix descriptor operations are unavailable, acquisition fails rather than starting an unprotected TUI. Unmanaged output is preserved in the process log, including native crash diagnostics. Windows retains its existing output path; this Unix descriptor guard does not isolate Windows inherited handles.
+
+### Output performance measurements
+
+Set `PI_TUI_OUTPUT_METRICS=/absolute/path/output.jsonl` before starting OMP to collect one aggregate per terminal ownership interval. With it unset, no metrics object, per-write clock read, byte-count scan, or metrics-file write is performed. Records contain timing/counts only, not rendered content:
+
+| Field | Meaning |
+| --- | --- |
+| `startMs`, `isolationMs` | Terminal startup and descriptor-acquisition wall time |
+| `writeCalls`, `writeBytes`, `writeMs` | Renderer write attempts, UTF-8 bytes, and cumulative enqueue/fallback-write time |
+| `peakPendingBytes` | Largest sampled renderer output backlog |
+| `stopMs` | Restoration/teardown wall time, including bounded native-writer drain |
+| `elapsedMs`, `isolated`, `pump`, `pid`, `platform` | Ownership duration and execution context |
+
+`writeMs` is not terminal presentation latency or child-output time. Metrics serialization happens after teardown and is excluded from `stopMs`; the external benchmark includes it in total stop latency.
+
+The repeatable native-PTY benchmark separates idle rendering, quiet children, inherited diagnostics, raw writer bursts, startup, and shutdown. Run the same workload before and after changing production code:
+
+```sh
+bun packages/tui/bench/terminal-output.bench.ts --label before
+bun packages/tui/bench/terminal-output.bench.ts --label after
+bun packages/tui/bench/terminal-output.bench.ts compare
+```
+
+Results and raw captures default to `~/tmp/omp-terminal-repro/`. Keep before/after runs uninstrumented to measure the default path. Use a separate label and `PI_TUI_OUTPUT_METRICS` destination to measure instrumentation overhead. The benchmark reports medians, p95, and run-to-run dispersion; reduced noisy-child time is a sink change, not evidence that terminal rendering became faster.
+
 ## Resize
 
 During resize, TUI borrows the alternate buffer. The frame provider supplies a full semantic viewport tail for that transient buffer; history offers are never acknowledged there. After a short quiet window TUI restores the normal buffer — which the terminal has reflowed — and recovers the viewport anchor with a DSR (CSI 6n) round trip: every normal paint parks the hardware cursor at a known viewport offset, terminals keep that cursor attached to its logical line through width rewrap, and the settled anchor is `min(reported − parkOffset, height − staleReflowedRows)`. The second bound reconstructs height-shrink scrollback pushes that clamp the cursor instead of scrolling it (bottom-preserving resize guarantees the stale viewport ends on the last screen row whenever a push happened); multiplexers clip instead of rewrapping, so the stale-row measure counts one row per row there. The repaint waits for the CPR reply (200 ms timeout falls back to the bounded retained anchor); `packages/tui/test/resize-anchor-recovery.test.ts` validates the formula against kitty's real core.

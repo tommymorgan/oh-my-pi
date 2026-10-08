@@ -1,10 +1,11 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
+import * as tty from "node:tty";
 import { TtyWriter } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, isTerminalHeadless, isWsl } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
-import { restoreTerminalStderr, suppressTerminalStderr } from "@oh-my-pi/pi-utils/stderr-guard";
+import { restoreTerminalOutput, suppressTerminalOutput } from "@oh-my-pi/pi-utils/terminal-output-guard";
 import {
 	encodeBundledGlyphRegistrations,
 	encodeGlyphCoverageQuery,
@@ -25,6 +26,7 @@ import {
 } from "./terminal-capabilities";
 import { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
 import { setHangulCompatibilityJamoWidth } from "./utils";
+import { TerminalOutputMetrics } from "./terminal-output-metrics";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -396,10 +398,8 @@ function createConsoleCodepageGuard(): (() => void) | null {
  */
 export function emergencyTerminalRestore(): void {
 	try {
-		// Crash paths must surface subsequent stderr (fatal reports) on the
-		// real terminal; no-op when the stderr guard is inactive.
-		restoreTerminalStderr();
 		const terminal = activeTerminal;
+		if (!terminal) restoreTerminalOutput();
 		if (terminal) {
 			// Keyboard enhancement state is screen-local: pop the alt-screen
 			// frame before leaving it, then let stop() pop omp's main-screen frame.
@@ -767,6 +767,9 @@ export class ProcessTerminal implements Terminal {
 	// enqueues frames and performs the blocking write(2) on its own thread;
 	// `pendingOutputBytes` exposes the backlog for render-side frame skipping.
 	#outputPump?: TtyWriter;
+	#outputFd: number | null = null;
+	#outputStream?: tty.WriteStream;
+	#outputMetrics?: TerminalOutputMetrics;
 
 	#windowsVTInputRestore?: () => void;
 	#xtermScrollToBottomRestoreModes = new Set<number>();
@@ -918,6 +921,9 @@ export class ProcessTerminal implements Terminal {
 		// escapes never reach the developer's terminal during `bun test`.
 		this.#headless = isTerminalHeadless();
 		if (this.#headless) return;
+		this.#wasRaw = process.stdin.isRaw || false;
+		const metricsPath = $env.PI_TUI_OUTPUT_METRICS;
+		this.#outputMetrics = metricsPath ? new TerminalOutputMetrics(metricsPath) : undefined;
 		registerPostmortemTerminalRestore();
 
 		// Register for emergency cleanup
@@ -935,22 +941,45 @@ export class ProcessTerminal implements Terminal {
 			}
 		}
 
-		// Keep unmanaged fd-2 writes (macOS libmalloc/framework diagnostics) off
-		// the viewport while we own the terminal; released in stop(). See
-		// stderr-guard in pi-utils (mirrors openai/codex#24459).
-		suppressTerminalStderr();
+		const isolationStarted = this.#outputMetrics ? performance.now() : 0;
+		try {
+			this.#outputFd = suppressTerminalOutput();
+			if (this.#outputFd !== null && !this.#outputStream) {
+				this.#outputStream = new tty.WriteStream(this.#outputFd);
+				this.#outputStream.on("error", this.#stdoutErrorHandler);
+				process.stdout.columns = this.#outputStream.columns;
+				process.stdout.rows = this.#outputStream.rows;
+			}
+		} catch (err) {
+			this.stop();
+			throw err;
+		}
+		if (this.#outputMetrics) {
+			this.#outputMetrics.isolationMs = performance.now() - isolationStarted;
+			this.#outputMetrics.isolated = this.#outputFd !== null;
+			this.#outputMetrics.pump = this.#outputPump !== undefined;
+		}
 
-		// Set up resize handler immediately. The OS refreshes process.stdout
-		// dimensions before firing `resize`, so it is authoritative for geometry:
-		// reconcile any stale cached DEC 2048 report before notifying the renderer.
+		// After redirection, refresh geometry through the saved terminal fd.
+		// Notify only on a size change, matching stdout's resize event semantics.
 		this.#stdoutResizeListener = () => {
+			const output = this.#outputStream;
+			if (output) {
+				const oldColumns = output.columns;
+				const oldRows = output.rows;
+				if ("_refreshSize" in output && typeof output._refreshSize === "function") output._refreshSize();
+				process.stdout.columns = output.columns;
+				process.stdout.rows = output.rows;
+				if (oldColumns === output.columns && oldRows === output.rows) return;
+			}
 			// Conservative: some hosts reset modes across a resize/reattach, so
 			// re-establish cursor visibility on the next explicit call.
 			this.#cursorVisible = undefined;
 			this.#reconcileInBandGeometryOnResize();
 			this.#resizeHandler?.();
 		};
-		process.stdout.on("resize", this.#stdoutResizeListener);
+		if (this.#outputStream) process.on("SIGWINCH", this.#stdoutResizeListener);
+		else process.stdout.on("resize", this.#stdoutResizeListener);
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only.
@@ -960,11 +989,13 @@ export class ProcessTerminal implements Terminal {
 
 		setHangulCompatibilityJamoWidth(TERMINAL.hangulJamoWidth);
 
+		if (this.#outputMetrics) this.#outputMetrics.startMs = performance.now() - this.#outputMetrics.startedAt;
 		if (options?.deferInput) {
 			this.#inputDeferred = true;
 			return;
 		}
 		this.#attachInput();
+		if (this.#outputMetrics) this.#outputMetrics.startMs = performance.now() - this.#outputMetrics.startedAt;
 	}
 
 	enableInput(): void {
@@ -1896,10 +1927,12 @@ export class ProcessTerminal implements Terminal {
 			activeTerminal = null;
 		}
 
-		// Release terminal ownership of fd 2 first so external programs,
-		// suspend, and shutdown see the real stderr even if a later teardown
-		// step throws.
-		restoreTerminalStderr();
+		const stopStarted = this.#outputMetrics ? performance.now() : 0;
+		// Release fd 1/2 before external editors, suspend, or a fatal report.
+		this.#outputStream?.destroy();
+		this.#outputStream = undefined;
+		this.#outputFd = null;
+		restoreTerminalOutput();
 
 		if (this.#clearProgressTimer()) {
 			this.#safeWrite(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
@@ -2013,6 +2046,7 @@ export class ProcessTerminal implements Terminal {
 		this.#appearance = undefined;
 		if (this.#stdoutResizeListener) {
 			process.stdout.removeListener("resize", this.#stdoutResizeListener);
+			process.removeListener("SIGWINCH", this.#stdoutResizeListener);
 			this.#stdoutResizeListener = undefined;
 		}
 		this.#disarmStdoutStallWatchdog();
@@ -2045,6 +2079,8 @@ export class ProcessTerminal implements Terminal {
 		// After stop() the terminal is shared with other writers; visibility
 		// tracking is only meaningful while this instance owns the TTY.
 		this.#cursorVisible = undefined;
+		this.#outputMetrics?.finish(performance.now() - stopStarted);
+		this.#outputMetrics = undefined;
 	}
 
 	#ensureStdoutErrorHandler(): void {
@@ -2093,6 +2129,19 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	#safeWrite(data: string): void {
+		const metrics = this.#outputMetrics;
+		if (!metrics) {
+			this.#writeOutput(data);
+			return;
+		}
+		const started = performance.now();
+		this.#writeOutput(data);
+		metrics.writeMs += performance.now() - started;
+		metrics.writeCalls++;
+		metrics.writeBytes += Buffer.byteLength(data, "utf8");
+	}
+
+	#writeOutput(data: string): void {
 		if (this.#headless) return;
 		if (this.#dead) return;
 		// Skip control sequences when stdout isn't a TTY (piped output, tests, log
@@ -2122,6 +2171,17 @@ export class ProcessTerminal implements Terminal {
 		// is ever translated through an OEM codepage. See ensureWindowsConsoleUtf8.
 		if (process.platform === "win32") ensureWindowsConsoleUtf8();
 		try {
+			if (this.#outputFd !== null) {
+				// Native pump unavailable: keep rendering on the saved TTY, never fd 1.
+				if (this.#conpty && Buffer.byteLength(data, "utf8") > MAX_CONPTY_WRITE_CHUNK_BYTES) {
+					for (const chunk of chunkForConPTY(data, MAX_CONPTY_WRITE_CHUNK_BYTES)) {
+						this.#writePrivateOutput(this.#outputFd, chunk);
+					}
+				} else {
+					this.#writePrivateOutput(this.#outputFd, data);
+				}
+				return;
+			}
 			// Windows ConPTY drops viewport tracking when a single write exceeds
 			// ~32-64 KB: the host UI's scroll position stays parked at wherever
 			// the write began, even though every byte landed in scrollback. Split
@@ -2153,6 +2213,16 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
+	#writePrivateOutput(fd: number, data: string): void {
+		const bytes = Buffer.from(data);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+			if (written <= 0) throw new Error("terminal output made no progress");
+			offset += written;
+		}
+	}
+
 	get columns(): number {
 		if (this.#inBandResizeActive && this.#reportedColumns) return this.#reportedColumns;
 		return process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
@@ -2181,6 +2251,9 @@ export class ProcessTerminal implements Terminal {
 	 * caught. See {@link StdoutStallWatchdog}, #6854, #10430, and #10434.
 	 */
 	#trackStdoutBacklog(pending: number): void {
+		if (this.#outputMetrics) {
+			this.#outputMetrics.peakPendingBytes = Math.max(this.#outputMetrics.peakPendingBytes, pending);
+		}
 		if (this.#stdoutStall.sample(pending, Date.now())) {
 			this.#disarmStdoutStallWatchdog();
 			this.#markTerminalDisconnected("stdout backlog stalled without draining; PTY consumer stalled");
