@@ -77,6 +77,7 @@ import {
 } from "./telemetry";
 import { validateAgentToolArguments } from "./tool-arguments";
 import { createAdditionalContextMessage, isNonBlankContext, joinAdditionalContext } from "./tool-context";
+import { settleToolExecution, TOOL_EXECUTION_CANCELLED } from "./tool-cancellation";
 import dsmlToolCallLeakPrompt from "./prompts/dsml-tool-call-leak.md" with { type: "text" };
 import type {
 	AgentContext,
@@ -1212,6 +1213,15 @@ async function runLoopBody(
 	// `liveAccepted` reached the model inside it, `liveDeferred` did not.
 	let liveAccepted: AgentMessage[] = [];
 	let liveDeferred: AgentMessage[] = [];
+	const finishToolCancellation = async (): Promise<void> => {
+		if (signal?.reason !== TERMINAL_TOOL_RESULT_ABORT_REASON) {
+			stream.push({ type: "turn_start" });
+			const aborted = emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal);
+			newMessages.push(aborted);
+			await emitTurnEnd(stream, currentContext, aborted, [], config, signal, { willContinue: false });
+		}
+		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+	};
 	try {
 		let messagesToEmit = [...initialMessages];
 		if (isDeadlineExceeded(config.deadline)) {
@@ -1278,14 +1288,14 @@ async function runLoopBody(
 				executionResult.additionalContext,
 			);
 			await emitTurnEnd(stream, currentContext, resumeTail, executionResult.toolResults, config, signal, {
-				willContinue: !isDeadlineExceeded(config.deadline),
+				willContinue: !signal?.aborted && !isDeadlineExceeded(config.deadline),
 				...(resumeContextMessage ? { additionalMessages: [resumeContextMessage] } : {}),
 			});
 			turnOpen = false;
-			// A tool hook may mark its completed result as terminal (e.g. subagent
-			// yield) — same stop-before-next-model-call rule as the main loop.
-			if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON) {
-				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+			// User cancellation and a terminal tool result both stop before another
+			// provider request, after the resumed calls have been paired.
+			if (signal?.aborted) {
+				await finishToolCancellation();
 				return;
 			}
 		}
@@ -1733,10 +1743,14 @@ async function runLoopBody(
 
 				await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
 					additionalMessages,
-					willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
+					willContinue: !signal?.aborted && hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
 				});
 				turnOpen = false;
 
+				if (signal?.aborted) {
+					await finishToolCancellation();
+					return;
+				}
 				if (isDeadlineExceeded(config.deadline)) {
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 					return;
@@ -3281,6 +3295,7 @@ async function executeToolCalls(
 			interruptible,
 			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
+			executionDetached: false,
 			result: undefined as AgentToolResult<any> | undefined,
 			isError: false,
 			skipped: false,
@@ -3551,37 +3566,72 @@ async function executeToolCalls(
 						steeringSignal: steeringSoftController.signal,
 						providerMetadata: toolCall.providerMetadata,
 						addAdditionalContext: context => {
-							if (isNonBlankContext(context)) record.reportedContext.push(context);
+							if (!record.executionDetached && isNonBlankContext(context)) record.reportedContext.push(context);
 						},
 					});
 					const streamSession = speculationCoordinator?.takeStreamSession(toolCall.id);
 					if (streamSession && toolContext) {
 						toolContext[SPECULATIVE_STREAM_SESSION] = streamSession;
-					} else if (streamSession && !streamSession.contextIndependent) {
-						await streamSession.discard("outer tool context cannot carry stream speculation");
 					}
-					executionStarted = true;
-					let rawResult: unknown;
-					try {
-						rawResult = await tool.execute(
-							toolCall.id,
-							executionArgs,
-							record.signal,
-							partialResult => {
-								stream.push({
-									type: "tool_execution_update",
-									toolCallId: toolCall.id,
-									toolName: toolCall.name,
-									args: executionArgs,
-									partialResult: coerceToolResult(partialResult).result,
-								});
-							},
-							toolContext,
-						);
-					} finally {
-						await streamSession?.discard("outer tool completed without committing stream speculation");
+					const execution = (async (): Promise<unknown> => {
+						try {
+							if (streamSession && !toolContext && !streamSession.contextIndependent) {
+								await streamSession.discard("outer tool context cannot carry stream speculation");
+							}
+							if (record.signal.aborted || record.executionDetached) {
+								isError = true;
+								return createToolSignalAbortedResult(record.signal);
+							}
+							executionStarted = true;
+							return await tool.execute(
+								toolCall.id,
+								executionArgs,
+								record.signal,
+								partialResult => {
+									if (record.executionDetached) return;
+									stream.push({
+										type: "tool_execution_update",
+										toolCallId: toolCall.id,
+										toolName: toolCall.name,
+										args: executionArgs,
+										partialResult: coerceToolResult(partialResult).result,
+									});
+								},
+								toolContext,
+							);
+						} finally {
+							await streamSession?.discard(
+								executionStarted
+									? "outer tool completed without committing stream speculation"
+									: "outer tool aborted before execution",
+							);
+						}
+					})();
+					const rawResult = await settleToolExecution(
+						execution,
+						signal,
+						{ toolCallId: toolCall.id, toolName: toolCall.name },
+						config.onToolExecutionStarted,
+						() => {
+							record.executionDetached = true;
+						},
+					);
+					if (rawResult === TOOL_EXECUTION_CANCELLED) {
+						result = executionStarted
+							? {
+									content: [
+										{
+											type: "text",
+											text: "Cancellation requested. Tool is still running; outcome unknown. It may still perform side effects. Do not repeat the operation until it settles.",
+										},
+									],
+									details: { execution: "started", outcome: "unknown" },
+								}
+							: createToolSignalAbortedResult(record.signal);
+						isError = true;
+						return;
 					}
-					completedToolExecution = true;
+					completedToolExecution = executionStarted;
 					const coerced = coerceToolResult(rawResult);
 					result = coerced.result;
 					if (coerced.malformed || result.isError) isError = true;
@@ -3590,12 +3640,13 @@ async function executeToolCalls(
 				caughtError = e;
 				result = {
 					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
+					details:
+						record.executionDetached && executionStarted ? { execution: "started", outcome: "unknown" } : {},
 				};
 				isError = true;
 			}
 
-			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+			if (afterToolCall && !record.executionDetached && (!record.signal.aborted || completedToolExecution)) {
 				try {
 					const after = await afterToolCall(
 						{
@@ -3640,7 +3691,7 @@ async function executeToolCalls(
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
 		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
-		if (interrupted && abortedDuringExecution) {
+		if (interrupted && abortedDuringExecution && !record.executionDetached) {
 			// This tool's own signal fired AND it failed to produce a result. The
 			// execution may already have performed partial work before throwing on
 			// abort, so preserve that distinction in the placeholder metadata.

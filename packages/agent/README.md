@@ -328,6 +328,36 @@ execute: async (toolCallId, params, signal, onUpdate) => {
 
 Thrown errors are caught by the agent and reported to the LLM as tool errors with `isError: true`.
 
+### Explicit cancellation
+
+After an external abort, a tool has 100 ms to finish cooperative cleanup. A completed
+result is preserved. Otherwise the loop emits one error result with
+`details: { execution: "started", outcome: "unknown" }` and an aborted assistant
+boundary, without requesting another provider response. Late progress, passive
+context, and results are not delivered. This grace applies only after cancellation;
+it is not a tool runtime limit.
+
+Visible settlement does not stop physical work or prove that side effects were
+rolled back. `Agent.waitForIdle()` waits for the visible run. Resource owners must
+await `Agent.waitForToolExecutions()` before releasing resources that a cancelled
+tool can still use. This physical drain has no deadline; a tool that never finishes
+keeps its resources owned. New prompts and continuations are refused until that
+work settles, even after the visible run ends. Do not retry an uncertain operation
+automatically.
+
+Low-level hosts using `agentLoop` or `agentLoopContinue` must register
+`AgentLoopConfig.onToolExecutionStarted` when they own resources used by tools.
+The hook receives an observed physical completion before the loop waits for tool
+execution or its stream cleanup. The completion always fulfills after
+execution and its owned cleanup settle; the shared cleanup tracker observes late
+failures. Abort before draining these completions and releasing resources. Unlike
+`waitForIdle()`, the physical drain does not wait for provider unwind. Exceptions
+from the ownership callback surface as tool errors. A started execution retains
+unknown-outcome metadata.
+
+Cancellation before execution starts reports that the tool was not executed.
+Stream cleanup still remains owned and cannot start the tool after cancellation.
+
 ## Proxy Usage
 
 For browser apps that proxy through a backend:

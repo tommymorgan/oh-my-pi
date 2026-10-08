@@ -9,7 +9,16 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
-import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	isRecord,
+	logger,
+	popLoopPhase,
+	prompt,
+	pushLoopPhase,
+	sanitizeText,
+	trackLateCleanup,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -94,7 +103,6 @@ import { buildOutputValidator, summarizeValidationFailure } from "../tools/outpu
 import { ToolAbortError } from "../tools/tool-errors";
 import { resetYieldTurnState } from "../tools/yield";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
-import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { isCompletionProbeEnabled, startCompletionProbe } from "./completion-probe";
@@ -3321,101 +3329,106 @@ export async function finalizeSubagentLifecycle(args: {
 	const ref = registry.get(args.id);
 	const ownsRef = Boolean(ref && ref.session === args.session);
 	const cleanupDeadlineAt = args.cleanupDeadlineAt ?? Date.now() + 5000;
-	const disposeSession = async (): Promise<void> => {
-		// On a graceful finish (e.g. a `yield`) the advisor's review of the final
-		// turn was enqueued at turn end but may still be draining. Give it a
-		// chance to land in the transcript before the runtime is torn down —
-		// mirroring print mode's headless drain — bounded by the shared cleanup
-		// deadline. Hard aborts skip this to keep kill teardown fast.
-		if (!args.aborted) {
-			args.session.prepareForHeadlessAdvisorDrain();
-			await args.session.waitForAdvisorCatchup(Math.max(0, cleanupDeadlineAt - Date.now()));
-		}
-		const disposal = args.session.dispose();
-		const remainingMs = Math.max(0, cleanupDeadlineAt - Date.now());
-		try {
-			await untilAborted(AbortSignal.timeout(remainingMs), () => disposal);
-		} catch (error) {
-			if (Date.now() >= cleanupDeadlineAt) {
-				args.onCleanupDeferred?.(disposal);
-				return;
+	// One owned completion covers disposal AND resource release, including the
+	// registered lifecycle path. A deadline must not release a live workspace.
+	const completion = (async (): Promise<void> => {
+		const disposeSession = async (): Promise<void> => {
+			// On a graceful finish (e.g. a `yield`) the advisor's review of the final
+			// turn was enqueued at turn end but may still be draining. Give it a
+			// chance to land in the transcript before the runtime is torn down —
+			// mirroring print mode's headless drain — bounded by the shared cleanup
+			// deadline. Hard aborts skip this to keep kill teardown fast.
+			if (!args.aborted) {
+				args.session.prepareForHeadlessAdvisorDrain();
+				await args.session.waitForAdvisorCatchup(Math.max(0, cleanupDeadlineAt - Date.now()));
 			}
-			logger.warn("Subagent session cleanup failed", {
-				id: args.id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	};
-	const releaseOwnedResources = async (): Promise<void> => {
-		try {
-			await args.onRelease?.();
-		} catch (error) {
-			logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
-		}
-	};
+			try {
+				await args.session.dispose();
+			} catch (error) {
+				logger.warn("Subagent session cleanup failed", {
+					id: args.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
+		const releaseOwnedResources = async (): Promise<void> => {
+			try {
+				await args.onRelease?.();
+			} catch (error) {
+				logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
+			}
+		};
 
-	// A budget abort leaves a consistent session with its transcript on disk.
-	// Manager shutdown also preserves the transcript, but disposes and unregisters
-	// the process-local session. Caller signals, wall-clock timeouts, and internal
-	// terminations are genuine kills and stay terminal.
-	const resumableAbort = args.abortKind === "budget" && args.keepAlive && args.reviveSession !== null;
-	if (args.aborted && !resumableAbort) {
-		if (ref && ownsRef) {
-			if (args.abortKind === "shutdown") {
-				try {
-					await AgentLifecycleManager.global().release(args.id, ref);
-				} catch (error) {
-					logger.warn("runSubagent: failed to release session during manager shutdown", {
-						id: args.id,
-						error: String(error),
-					});
-					await disposeSession();
-					registry.unregister(args.id, ref);
+		// A budget abort leaves a consistent session with its transcript on disk.
+		// Manager shutdown also preserves the transcript, but disposes and unregisters
+		// the process-local session. Caller signals, wall-clock timeouts, and internal
+		// terminations are genuine kills and stay terminal.
+		const resumableAbort = args.abortKind === "budget" && args.keepAlive && args.reviveSession !== null;
+		if (args.aborted && !resumableAbort) {
+			if (ref && ownsRef) {
+				if (args.abortKind === "shutdown") {
+					try {
+						await AgentLifecycleManager.global().release(args.id, ref);
+					} catch (error) {
+						logger.warn("runSubagent: failed to release session during manager shutdown", {
+							id: args.id,
+							error: String(error),
+						});
+						await disposeSession();
+						registry.unregister(args.id, ref);
+					}
+				} else {
+					// Route hard kills through the lifecycle owner so the terminal
+					// decision is durable and a restart cannot rediscover the transcript
+					// as a revivable parked agent.
+					try {
+						await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+					} catch (error) {
+						logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
+						registry.setStatus(args.id, "aborted", ref);
+						registry.detachSession(args.id, ref);
+						await disposeSession();
+					}
 				}
 			} else {
-				// Route hard kills through the lifecycle owner so the terminal
-				// decision is durable and a restart cannot rediscover the transcript
-				// as a revivable parked agent.
-				try {
-					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
-				} catch (error) {
-					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
-					registry.setStatus(args.id, "aborted", ref);
-					registry.detachSession(args.id, ref);
-					await disposeSession();
-				}
+				await disposeSession();
 			}
-		} else {
-			await disposeSession();
+			await releaseOwnedResources();
+			return;
 		}
-		await releaseOwnedResources();
-		return;
-	}
 
-	if (!args.keepAlive) {
-		// One-shot helper: dispose and unregister. No IRC, no revival.
-		await disposeSession();
-		if (ref && ownsRef) registry.unregister(args.id, ref);
-		await releaseOwnedResources();
-		return;
-	}
+		if (!args.keepAlive) {
+			// One-shot helper: dispose and unregister. No IRC, no revival.
+			await disposeSession();
+			if (ref && ownsRef) registry.unregister(args.id, ref);
+			await releaseOwnedResources();
+			return;
+		}
 
-	// Keep-alive: finished and failed subagents both stay interrogable.
-	// The lifecycle manager owns idle-TTL parking + revival from here on.
-	if (!ref || !ownsRef || !registry.setStatus(args.id, "idle", ref)) {
-		await disposeSession();
-		await releaseOwnedResources();
-		return;
+		// Keep-alive: finished and failed subagents both stay interrogable.
+		// The lifecycle manager owns idle-TTL parking + revival from here on.
+		if (!ref || !ownsRef || !registry.setStatus(args.id, "idle", ref)) {
+			await disposeSession();
+			await releaseOwnedResources();
+			return;
+		}
+		AgentLifecycleManager.global().adopt(
+			args.id,
+			{
+				idleTtlMs: args.agentIdleTtlMs,
+				revive: args.reviveSession ?? undefined,
+				onRelease: args.onRelease,
+			},
+			ref,
+		);
+	})();
+	try {
+		await untilAborted(AbortSignal.timeout(Math.max(0, cleanupDeadlineAt - Date.now())), () => completion);
+	} catch (error) {
+		if (Date.now() < cleanupDeadlineAt) throw error;
+		trackLateCleanup(completion, { id: args.id, resource: "subagent-lifecycle" });
+		args.onCleanupDeferred?.(completion);
 	}
-	AgentLifecycleManager.global().adopt(
-		args.id,
-		{
-			idleTtlMs: args.agentIdleTtlMs,
-			revive: args.reviveSession ?? undefined,
-			onRelease: args.onRelease,
-		},
-		ref,
-	);
 }
 
 /** Options for {@link runSubagentFollowUpTurn}. */

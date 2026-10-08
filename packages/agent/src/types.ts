@@ -177,6 +177,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	interruptMode?: "immediate" | "wait";
 
+	/** Receive each observed physical completion at tool start. Owners must drain it before teardown. */
+	onToolExecutionStarted?: (completion: Promise<void>) => void;
+
 	/**
 	 * Optional session identifier forwarded to LLM providers.
 	 * Used by providers that support session-based caching (e.g., OpenAI Codex).

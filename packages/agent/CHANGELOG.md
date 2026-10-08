@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed cancellation leaving tool calls pending indefinitely; unfinished calls now report an unknown outcome while their live work remains owned ([#8798](https://github.com/can1357/oh-my-pi/issues/8798)).
+
 ## [18.8.1] - 2026-10-07
 
 ### Added

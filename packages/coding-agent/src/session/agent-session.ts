@@ -5572,6 +5572,12 @@ export class AgentSession implements SettingsScope {
 		this.abortCompaction();
 		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
+		// Prevent late provider frames from repopulating state while physical tools drain.
+		this.agent.setProviderResponseInterceptor(undefined);
+		this.agent.setRawSseEventInterceptor(undefined);
+		// Task's existing bounded disposal/quarantine owns this drain; never release
+		// isolated resources while a cancelled tool can still write to them.
+		await this.agent.waitForToolExecutions();
 		try {
 			await withTimeout(
 				postPromptDrain,
@@ -5633,14 +5639,9 @@ export class AgentSession implements SettingsScope {
 		// A dispose triggered mid-turn (Ctrl-C / timeout / hard-killed subagent)
 		// only *signals* the agent loop via the earlier abort(); the loop and the
 		// session's fire-and-forget event handlers still unwind asynchronously.
-		// Detach the response/SSE interceptors so a late frame cannot re-record
-		// into rawSseDebugBuffer, then wait (bounded) for both the core run AND
-		// the in-flight event/persistence handlers to settle — the latter can
-		// still append the finished message/entries after agent.waitForIdle()
-		// alone. Without this the release races the unwind and a disposed session
-		// is repopulated with exactly the state we are trying to drop.
-		this.agent.setProviderResponseInterceptor(undefined);
-		this.agent.setRawSseEventInterceptor(undefined);
+		// Response/SSE interceptors were detached before draining physical tools.
+		// Bound the core run and event/persistence drain separately: provider unwind
+		// must not keep disposal alive after its resource-using tools have settled.
 		let drained = false;
 		try {
 			await withTimeout(

@@ -1,9 +1,9 @@
-import { logger } from "@oh-my-pi/pi-utils";
+import * as logger from "./logger";
 
 const pendingCleanups = new Set<Promise<void>>();
 
-/** Keep timed-out cleanup reachable until its resources really settle. */
-export function trackLateCleanup(work: Promise<void>, context: Record<string, unknown>): void {
+/** Keep deferred work reachable and observe failures until its resources really settle. */
+export function trackLateCleanup(work: Promise<void>, context: Record<string, unknown>): Promise<void> {
 	const tracked = work
 		.catch(error => {
 			logger.warn("Deferred cleanup failed", {
@@ -13,4 +13,5 @@ export function trackLateCleanup(work: Promise<void>, context: Record<string, un
 		})
 		.finally(() => pendingCleanups.delete(tracked));
 	pendingCleanups.add(tracked);
+	return tracked;
 }

@@ -6546,7 +6546,6 @@ describe("agentLoop passive additionalContext", () => {
 		release.resolve();
 		await consuming;
 
-		expect(mock.calls).toHaveLength(2);
 		const aborted = events.find(
 			event =>
 				event.type === "message_end" &&

@@ -473,6 +473,7 @@ export class Agent {
 	#cwdResolver?: () => string | undefined;
 
 	#runningPrompt?: Promise<void>;
+	#pendingToolExecutions = new Set<Promise<void>>();
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
@@ -1501,6 +1502,19 @@ export class Agent {
 		return this.#runningPrompt ?? Promise.resolve();
 	}
 
+	/** Drain physical tools before releasing resources; visible cancellation may have already settled. */
+	async waitForToolExecutions(): Promise<void> {
+		while (this.#pendingToolExecutions.size > 0) await Promise.all(this.#pendingToolExecutions);
+	}
+
+	#assertToolExecutionsSettled(): void {
+		if (this.#pendingToolExecutions.size > 0) {
+			throw new AgentBusyError(
+				"A previous tool call is still settling. Wait for it to settle before starting another run.",
+			);
+		}
+	}
+
 	/**
 	 * Wait for a steering message without consuming the steering queue.
 	 *
@@ -1549,6 +1563,7 @@ export class Agent {
 		imagesOrOptions?: ImageContent[] | AgentPromptOptions,
 		options?: AgentPromptOptions,
 	) {
+		this.#assertToolExecutionsSettled();
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1611,6 +1626,7 @@ export class Agent {
 	}
 
 	async continue(signal?: AbortSignal) {
+		this.#assertToolExecutionsSettled();
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1823,6 +1839,11 @@ export class Agent {
 			serviceTier: this.#serviceTier,
 			hideThinkingSummary: this.#hideThinkingSummary,
 			interruptMode: this.#interruptMode,
+			onToolExecutionStarted: completion => {
+				this.#pendingToolExecutions.add(completion);
+				// The observed physical completion always fulfills, including after execution failure.
+				void completion.then(() => this.#pendingToolExecutions.delete(completion));
+			},
 			sessionId: this.#sessionId,
 			deadline: this.#deadline,
 			promptCacheKey: this.#promptCacheKey,
