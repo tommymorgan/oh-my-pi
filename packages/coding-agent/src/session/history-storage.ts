@@ -13,7 +13,7 @@ import { closeSessionIndex, salvageSessionIndex } from "./session-index";
 
 /** A unique prompt with provenance from its most recent submission. */
 export interface HistoryEntry {
-	/** Stable row identifier used by the full-text index. */
+	/** Stable row identifier within the requested history scope. */
 	id: number;
 	/** Trimmed prompt text, unique across the history database. */
 	prompt: string;
@@ -31,7 +31,7 @@ export interface HistoryEntry {
 export interface HistoryFilter {
 	/** Exact project working directory of the prompt's latest submission. */
 	cwd?: string;
-	/** Exact session id of the prompt's latest submission. */
+	/** Exact conversation id; recent reads retain membership across resubmissions. */
 	sessionId?: string;
 }
 
@@ -43,6 +43,19 @@ type HistoryRow = {
 	session_id: string | null;
 	use_count: number;
 };
+
+/** Reject foreign rows decoded from cross-linked SQLite pages before copying. */
+function isReadableHistoryRow(row: Record<keyof HistoryRow, unknown>): row is HistoryRow {
+	return (
+		Number.isSafeInteger(row.id) &&
+		typeof row.prompt === "string" &&
+		row.prompt.trim() !== "" &&
+		Number.isSafeInteger(row.created_at) &&
+		Number.isSafeInteger(row.use_count) &&
+		(row.cwd === null || typeof row.cwd === "string") &&
+		(row.session_id === null || typeof row.session_id === "string")
+	);
+}
 
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
@@ -108,7 +121,7 @@ const RECENT_WINDOW = 100;
 
 let cancelExitCleanup: (() => void) | undefined;
 
-/** Stores searchable prompts with only their latest project and session metadata. */
+/** Shared prompt search plus durable, conversation-owned recall. */
 export class HistoryStorage {
 	#db: Database;
 	static #instance?: HistoryStorage;
@@ -121,6 +134,8 @@ export class HistoryStorage {
 	#upsertRowStmt: Statement;
 	#recentStmt: Statement;
 	#searchStmt: Statement;
+	#sessionRecentStmt: Statement;
+	#sessionUpsertStmt: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
 
@@ -157,6 +172,48 @@ END;
 			}
 		}
 		this.#assertRecentWindowReadable();
+		this.#db.transaction(() => {
+			const hadSessionHistory = this.#db
+				.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_sessions'")
+				.get();
+			this.#db.run(`
+CREATE TABLE IF NOT EXISTS history_sessions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	session_id TEXT NOT NULL,
+	prompt TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	cwd TEXT,
+	use_count INTEGER NOT NULL DEFAULT 1,
+	-- NULL marks genuine submissions; zero marks migration seeds awaiting journal order.
+	journal_order INTEGER,
+	UNIQUE(session_id, prompt)
+);
+CREATE INDEX IF NOT EXISTS idx_history_sessions_recent ON history_sessions(session_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS history_session_imports (session_id TEXT PRIMARY KEY);
+		`);
+			const sessionColumns = this.#db.query<{ name: string }, []>("PRAGMA table_info(history_sessions)").all();
+			if (!sessionColumns.some(column => column.name === "journal_order")) {
+				this.#db.run("ALTER TABLE history_sessions ADD COLUMN journal_order INTEGER");
+			}
+			if (!hadSessionHistory) {
+				this.#db.run(`
+INSERT OR IGNORE INTO history_sessions (session_id, prompt, created_at, cwd, use_count, journal_order)
+	SELECT session_id, prompt, created_at, cwd, use_count, 0 FROM history
+	WHERE session_id IS NOT NULL AND ${readableRowClause("")}
+	ORDER BY created_at, id;
+			`);
+			}
+		})();
+		this.#sessionRecentStmt = this.#db.prepare(
+			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history_sessions WHERE session_id = ?2 AND (?1 IS NULL OR cwd = ?1) AND ${readableRowClause("")} ORDER BY created_at DESC, (journal_order IS NULL) DESC, journal_order DESC, id DESC LIMIT ?3`,
+		);
+		// Replacing only the membership row refreshes same-second submission order;
+		// the globally unique prompt row and its FTS identity remain untouched.
+		this.#sessionUpsertStmt = this.#db.prepare(`
+INSERT OR REPLACE INTO history_sessions (session_id, prompt, created_at, cwd, use_count)
+VALUES (?1, ?2, ${SQLITE_NOW_EPOCH}, ?3,
+	coalesce((SELECT use_count FROM history_sessions WHERE session_id = ?1 AND prompt = ?2), 0) + 1)
+		`);
 		this.#recentStmt = this.#db.prepare(
 			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${readableRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
@@ -227,6 +284,8 @@ ON CONFLICT(prompt) DO UPDATE SET
 		this.#upsertRowStmt.finalize();
 		this.#recentStmt.finalize();
 		this.#searchStmt.finalize();
+		this.#sessionRecentStmt.finalize();
+		this.#sessionUpsertStmt.finalize();
 		this.#db.close();
 	}
 
@@ -234,6 +293,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		this.#db.transaction((rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>) => {
 			for (const row of rows) {
 				this.#upsertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
+				if (row.sessionId) this.#sessionUpsertStmt.run(row.sessionId, row.prompt, row.cwd ?? null);
 			}
 		})(rows);
 	}
@@ -245,6 +305,50 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 */
 	setSessionResolver(resolver: () => string | undefined): void {
 		this.#sessionResolver = resolver;
+	}
+
+	/**
+	 * Recover pre-feature human prompts from the loaded conversation once. The
+	 * lazy source is never read again after import, so expanded journal messages
+	 * cannot replace original command spellings captured by add().
+	 */
+	restoreSession(
+		sessionId: string,
+		prompts: () => Iterable<{ prompt: string; created_at: number }>,
+		cwd?: string,
+	): void {
+		try {
+			if (this.#db.query("SELECT 1 FROM history_session_imports WHERE session_id = ?").get(sessionId)) return;
+			this.#db.transaction(() => {
+				if (this.#db.query("SELECT 1 FROM history_session_imports WHERE session_id = ?").get(sessionId)) return;
+				const reorderSeed = this.#db.query(`
+UPDATE history_sessions SET journal_order = ?4
+	WHERE session_id = ?1 AND prompt = ?2 AND journal_order IS NOT NULL AND created_at <= ?3
+				`);
+				const insert = this.#db.query(
+					"INSERT OR IGNORE INTO history_sessions (session_id, prompt, created_at, cwd, journal_order) VALUES (?, ?, ?, ?, ?)",
+				);
+				const latest = new Map<string, number>();
+				for (const entry of prompts()) {
+					const prompt = normalizePrompt(entry.prompt);
+					if (prompt && Number.isSafeInteger(entry.created_at)) {
+						latest.delete(prompt);
+						latest.set(prompt, entry.created_at);
+					}
+				}
+				// Recovered journal order breaks second-resolution ties, but must stay
+				// below genuine submissions already captured in this second.
+				let journalOrder = 0;
+				for (const [prompt, createdAt] of latest) {
+					journalOrder++;
+					reorderSeed.run(sessionId, prompt, createdAt, journalOrder);
+					insert.run(sessionId, prompt, createdAt, cwd ?? null, journalOrder);
+				}
+				this.#db.query("INSERT OR IGNORE INTO history_session_imports (session_id) VALUES (?)").run(sessionId);
+			})();
+		} catch (error) {
+			logger.error("HistoryStorage session recovery failed", { sessionId, error: String(error) });
+		}
 	}
 
 	/** Register a callback run after each successful {@link add}, once the row is durable. */
@@ -290,7 +394,8 @@ ON CONFLICT(prompt) DO UPDATE SET
 		if (safeLimit === 0) return [];
 
 		try {
-			const rows = this.#recentStmt.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
+			const statement = filter.sessionId === undefined ? this.#recentStmt : this.#sessionRecentStmt;
+			const rows = statement.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
@@ -476,14 +581,18 @@ ON CONFLICT(prompt) DO UPDATE SET
 				source,
 				"history",
 				"id, prompt, created_at, cwd, session_id, use_count",
-			).filter(
-				row =>
-					Number.isSafeInteger(row.id) &&
-					typeof row.prompt === "string" &&
-					row.prompt.trim() !== "" &&
-					Number.isSafeInteger(row.created_at) &&
-					Number.isSafeInteger(row.use_count),
-			);
+			).filter(isReadableHistoryRow);
+			const sessionColumns = source.query<{ name: string }, []>("PRAGMA table_info(history_sessions)").all();
+			const orderSelection = sessionColumns.some(column => column.name === "journal_order")
+				? "journal_order"
+				: "NULL AS journal_order";
+			const sessions = sessionColumns.length
+				? readSalvageableRows<Record<keyof HistoryRow, unknown> & { journal_order: unknown }>(
+						source,
+						"history_sessions",
+						`id, prompt, created_at, cwd, session_id, use_count, ${orderSelection}`,
+					).filter((row): row is HistoryRow & { journal_order: unknown } => isReadableHistoryRow(row))
+				: prompts.map(row => ({ ...row, journal_order: 0 }));
 			let sequence: number | undefined;
 			try {
 				sequence = source
@@ -491,6 +600,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 					.get()?.seq;
 			} catch {}
 			const target = this.#db;
+			const sourceDb = source;
 			const counts = target.transaction(() => {
 				using insert = target.prepare(`
 INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
@@ -502,13 +612,32 @@ ON CONFLICT(prompt) DO UPDATE SET
 	session_id = iif(excluded.created_at > history.created_at, excluded.session_id, history.session_id)
 				`);
 				for (const row of prompts) {
-					insert.run(
-						row.id as number,
-						row.prompt as string,
-						row.created_at as number,
-						typeof row.cwd === "string" ? row.cwd : null,
-						typeof row.session_id === "string" ? row.session_id : null,
-						row.use_count as number,
+					insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
+				}
+				using insertSession = target.prepare(`
+INSERT INTO history_sessions (id, session_id, prompt, created_at, cwd, use_count, journal_order)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM history_sessions WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5, ?6, ?7)
+ON CONFLICT(session_id, prompt) DO UPDATE SET
+	use_count = history_sessions.use_count + excluded.use_count,
+	created_at = max(history_sessions.created_at, excluded.created_at),
+	cwd = iif(excluded.created_at > history_sessions.created_at, excluded.cwd, history_sessions.cwd),
+	journal_order = CASE
+		WHEN history_sessions.journal_order IS NULL OR excluded.journal_order IS NULL THEN NULL
+		WHEN excluded.created_at > history_sessions.created_at THEN excluded.journal_order
+		ELSE history_sessions.journal_order END
+				`);
+				for (const row of sessions) {
+					if (typeof row.session_id !== "string") continue;
+					insertSession.run(
+						row.id,
+						row.session_id,
+						row.prompt,
+						row.created_at,
+						row.cwd,
+						row.use_count,
+						typeof row.journal_order === "number" && Number.isSafeInteger(row.journal_order)
+							? row.journal_order
+							: null,
 					);
 				}
 				// Keep ids above every id the damaged store handed out: the prediction
@@ -516,7 +645,22 @@ ON CONFLICT(prompt) DO UPDATE SET
 				if (Number.isSafeInteger(sequence)) {
 					target.run("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'history'", [sequence as number]);
 				}
-				return { prompts: prompts.length, ...salvageSessionIndex(source as Database, target) };
+				const importColumns = sourceDb
+					.query<{ name: string }, []>("PRAGMA table_info(history_session_imports)")
+					.all();
+				if (importColumns.length) {
+					using insertImport = target.prepare(
+						"INSERT OR IGNORE INTO history_session_imports (session_id) VALUES (?)",
+					);
+					for (const row of readSalvageableRows<{ session_id: unknown }>(
+						sourceDb,
+						"history_session_imports",
+						"session_id",
+					)) {
+						if (typeof row.session_id === "string") insertImport.run(row.session_id);
+					}
+				}
+				return { prompts: prompts.length, ...salvageSessionIndex(sourceDb, target) };
 			})();
 			logger.warn("Salvaged readable rows from a damaged history database", { backupPath, ...counts });
 		} catch (error) {
@@ -578,5 +722,14 @@ ON CONFLICT(prompt) DO UPDATE SET
 			sessionId: row.session_id ?? undefined,
 			useCount: row.use_count,
 		};
+	}
+}
+
+/** Capture original human input without making history availability a submission prerequisite. */
+export function recordPromptHistory(prompt: string, cwd: string, sessionId: string): void {
+	try {
+		void HistoryStorage.open().add(prompt, cwd, sessionId);
+	} catch (error) {
+		logger.warn("Prompt history unavailable; submitting without recording", { error: String(error) });
 	}
 }

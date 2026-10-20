@@ -864,6 +864,27 @@ export const cfgLoopConditionTimeoutMs = register({
 });
 
 // Input and startup
+export const cfgComposerHistoryScope = register({
+	id: "composer.historyScope",
+	type: "enum",
+	values: ["all", "session"] as const,
+	default: "all",
+	ui: {
+		tab: "interaction",
+		group: "Input",
+		label: "Prompt History Scope",
+		description: "Which submitted prompts Up/Down recalls; history search is unchanged",
+		options: [
+			{ value: "all", label: "All sessions", description: "Recall prompts from all conversations" },
+			{
+				value: "session",
+				label: "Current session",
+				description: "Recall only this saved conversation, including before resume",
+			},
+		],
+	},
+});
+
 export const cfgComposerRecallClearedDrafts = register({
 	id: "composer.recallClearedDrafts",
 	type: "boolean",

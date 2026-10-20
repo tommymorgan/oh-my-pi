@@ -987,10 +987,11 @@ export class Editor implements Component, Focusable {
 	}
 
 	/** Loads persistent prompts for navigation and enables future persistence. */
-	setHistoryStorage(storage: HistoryStorage): void {
+	setHistoryStorage(storage: HistoryStorage, options?: { preserveDrafts?: boolean }): void {
 		this.#historyStorage = storage;
+		const drafts = options?.preserveDrafts ? this.#history.filter(entry => entry.draft) : [];
 		const recent = storage.getRecent(100);
-		this.#history = recent.map(entry => ({ text: entry.prompt }));
+		this.#history = [...drafts, ...recent.map(entry => ({ text: entry.prompt }))].slice(0, 100);
 		this.#historyIndex = -1;
 	}
 

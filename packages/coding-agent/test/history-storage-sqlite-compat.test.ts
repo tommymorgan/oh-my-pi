@@ -250,72 +250,117 @@ it("recalls and searches only text prompts when a row decodes as a BLOB", async 
 	expect(fs.readdirSync(tempDir.path()).filter(name => name.includes(".corrupt-"))).toEqual([]);
 });
 
-it("quarantines a store whose newest rows are unreadable and keeps every readable prompt, title, and recap", async () => {
-	tempDir = TempDir.createSync("@omp-history-storage-salvage-");
-	const dbPath = tempDir.join("history.db");
-	HistoryStorage.open(dbPath);
-	HistoryStorage.close();
-	const prompt = (id: number) => `prompt-${String(id).padStart(4, "0")}-${"x".repeat(180)}`;
-	const seed = new Database(dbPath);
-	// Zero freed space so each prompt's marker appears only on the leaf that holds it.
-	seed.run("PRAGMA secure_delete = ON");
-	seed.run(`
+it.each([false, true])(
+	"salvages readable prompts, titles, recaps, and session ownership (legacy membership: %s)",
+	async legacyMembership => {
+		tempDir = TempDir.createSync("@omp-history-storage-salvage-");
+		const dbPath = tempDir.join("history.db");
+		HistoryStorage.open(dbPath);
+		HistoryStorage.close();
+		const prompt = (id: number) => `prompt-${String(id).padStart(4, "0")}-${"x".repeat(180)}`;
+		const seed = new Database(dbPath);
+		// Zero freed space so each prompt's marker appears only on the leaf that holds it.
+		seed.run("PRAGMA secure_delete = ON");
+		seed.run(`
 CREATE TABLE session_titles (session_id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE session_recaps (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, cwd TEXT NOT NULL, recap TEXT NOT NULL, created_at INTEGER NOT NULL);
 INSERT INTO session_titles VALUES ('session-a', 'Title A', 1700000000);
 INSERT INTO session_recaps (session_id, cwd, recap, created_at) VALUES ('session-a', '/project', 'Recap A', 1700000000);
 	`);
-	const insert = seed.prepare("INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?, ?)");
-	seed.transaction(() => {
-		for (let id = 1; id <= 200; id++) insert.run(id, prompt(id), 1_700_000_000 + id, "/project", "session-a");
-	})();
-	insert.finalize();
-	seed.run("PRAGMA wal_checkpoint(TRUNCATE)");
-	const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
-	seed.close();
-
-	// Destroy the table leaf holding the newest prompts, which recall reads first.
-	// The UNIQUE index stores prompts too; table leaves carry b-tree page type 0x0d.
-	const bytes = fs.readFileSync(dbPath);
-	const pageOf = (id: number) => {
-		for (
-			let at = bytes.indexOf(prompt(id).slice(0, 12));
-			at !== -1;
-			at = bytes.indexOf(prompt(id).slice(0, 12), at + 1)
-		) {
-			const page = Math.floor(at / pageSize);
-			if (bytes[page * pageSize] === 0x0d) return page;
+		const insert = seed.prepare(
+			"INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?, ?)",
+		);
+		seed.transaction(() => {
+			for (let id = 1; id <= 200; id++) insert.run(id, prompt(id), 1_700_000_000 + id, "/project", "session-a");
+		})();
+		insert.finalize();
+		seed.run("UPDATE history SET use_count = 5 WHERE id = 1");
+		if (legacyMembership) {
+			seed.run("DROP TABLE history_sessions");
+			seed.run("DROP TABLE history_session_imports");
+		} else {
+			const insertSession = seed.query(
+				"INSERT INTO history_sessions (session_id, prompt, created_at, cwd, use_count) VALUES (?, ?, ?, ?, ?)",
+			);
+			insertSession.run("session-a", prompt(1), LEGACY_TIMESTAMP, "/a", 2);
+			insertSession.run("session-a", "alpha", LEGACY_TIMESTAMP, "/a", 1);
+			insertSession.run("session-b", prompt(1), LEGACY_TIMESTAMP, "/b", 3);
+			insertSession.run("session-a", "/skill:original raw arguments", LEGACY_TIMESTAMP, "/a", 4);
+			seed.run("INSERT INTO history_session_imports (session_id) VALUES ('session-a')");
 		}
-		throw new Error(`no table leaf holds prompt ${id}`);
-	};
-	const damagedPage = pageOf(200);
-	const lost = new Set(Array.from({ length: 200 }, (_, index) => index + 1).filter(id => pageOf(id) === damagedPage));
-	expect(lost.size).toBeLessThan(50);
-	const fd = fs.openSync(dbPath, "r+");
-	fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, damagedPage * pageSize);
-	fs.closeSync(fd);
+		seed.run("PRAGMA wal_checkpoint(TRUNCATE)");
+		const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+		seed.close();
 
-	const storage = HistoryStorage.open(dbPath);
-	const expected = Array.from({ length: 200 }, (_, index) => 200 - index)
-		.filter(id => !lost.has(id))
-		.map(prompt);
-	expect(storage.getRecent(1000).map(entry => entry.prompt)).toEqual(expected);
-	expect(storage.search("prompt 0001", 10).map(entry => entry.prompt)).toEqual([prompt(1)]);
-	await storage.add("after recovery", "/project", "session-b");
-	expect(storage.getRecent(1)[0]).toMatchObject({ prompt: "after recovery", id: 201 });
-	HistoryStorage.close();
+		// Destroy the table leaf holding the newest prompts, which recall reads first.
+		// The UNIQUE index stores prompts too; table leaves carry b-tree page type 0x0d.
+		const bytes = fs.readFileSync(dbPath);
+		const pageOf = (id: number) => {
+			for (
+				let at = bytes.indexOf(prompt(id).slice(0, 12));
+				at !== -1;
+				at = bytes.indexOf(prompt(id).slice(0, 12), at + 1)
+			) {
+				const page = Math.floor(at / pageSize);
+				if (bytes[page * pageSize] === 0x0d) return page;
+			}
+			throw new Error(`no table leaf holds prompt ${id}`);
+		};
+		const damagedPage = pageOf(200);
+		const lost = new Set(
+			Array.from({ length: 200 }, (_, index) => index + 1).filter(id => pageOf(id) === damagedPage),
+		);
+		expect(lost.size).toBeLessThan(50);
+		const fd = fs.openSync(dbPath, "r+");
+		fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, damagedPage * pageSize);
+		fs.closeSync(fd);
 
-	expect(fs.readdirSync(tempDir.path()).some(name => /^history\.db\.corrupt-[^.]+$/.test(name))).toBe(true);
-	const db = new Database(dbPath, { readonly: true });
-	try {
-		expect(db.query("SELECT session_id, title FROM session_titles").all()).toEqual([
-			{ session_id: "session-a", title: "Title A" },
-		]);
-		expect(db.query("SELECT session_id, cwd, recap FROM session_recaps").all()).toEqual([
-			{ session_id: "session-a", cwd: "/project", recap: "Recap A" },
-		]);
-		expect(db.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check).toBe("ok");
-	} finally {
-		db.close();
-	}
-});
+		const storage = HistoryStorage.open(dbPath);
+		const expected = Array.from({ length: 200 }, (_, index) => 200 - index)
+			.filter(id => !lost.has(id))
+			.map(prompt);
+		expect(storage.getRecent(1000).map(entry => entry.prompt)).toEqual(expected);
+		expect(storage.search("prompt 0001", 10).map(entry => entry.prompt)).toEqual([prompt(1)]);
+		const sessionA = storage.getRecent(1000, { sessionId: "session-a" });
+		if (legacyMembership) {
+			expect(sessionA.map(entry => entry.prompt)).toEqual(expected);
+			expect(sessionA.at(-1)).toMatchObject({ prompt: prompt(1), useCount: 5 });
+		} else {
+			expect(sessionA.map(entry => entry.prompt)).toEqual(["/skill:original raw arguments", "alpha", prompt(1)]);
+			expect(sessionA[0]).toMatchObject({ cwd: "/a", useCount: 4, created_at: LEGACY_TIMESTAMP });
+			expect(sessionA[2]).toMatchObject({ cwd: "/a", useCount: 2 });
+			expect(storage.getRecent(10, { sessionId: "session-b" })[0]).toMatchObject({
+				prompt: prompt(1),
+				cwd: "/b",
+				useCount: 3,
+			});
+			storage.restoreSession("session-a", () => [{ prompt: "expanded journal body", created_at: 1 }]);
+			expect(storage.getRecent(1000, { sessionId: "session-a" })).toEqual(sessionA);
+		}
+		expect(storage.getRecent(1000).find(entry => entry.prompt === prompt(1))).toMatchObject({
+			sessionId: "session-a",
+			useCount: 5,
+		});
+		await storage.add("after recovery", "/project", "session-b");
+		expect(storage.getRecent(1)[0]).toMatchObject({ prompt: "after recovery", id: 201 });
+		HistoryStorage.close();
+		const reopened = HistoryStorage.open(dbPath);
+		expect(reopened.getRecent(1000, { sessionId: "session-a" })).toEqual(sessionA);
+		expect(reopened.search("prompt 0001", 10)[0]).toMatchObject({ prompt: prompt(1), useCount: 5 });
+		HistoryStorage.close();
+
+		expect(fs.readdirSync(tempDir.path()).some(name => /^history\.db\.corrupt-[^.]+$/.test(name))).toBe(true);
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			expect(db.query("SELECT session_id, title FROM session_titles").all()).toEqual([
+				{ session_id: "session-a", title: "Title A" },
+			]);
+			expect(db.query("SELECT session_id, cwd, recap FROM session_recaps").all()).toEqual([
+				{ session_id: "session-a", cwd: "/project", recap: "Recap A" },
+			]);
+			expect(db.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check).toBe("ok");
+		} finally {
+			db.close();
+		}
+	},
+);

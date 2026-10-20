@@ -890,6 +890,7 @@ The `cost` segment shows recorded session costs. For an active provider/model wi
 | `steeringMode`         | enum    | `one-at-a-time` | `all`, `one-at-a-time`. How queued steering messages are delivered.                                     |
 | `followUpMode`         | enum    | `one-at-a-time` | `all`, `one-at-a-time`.                                                                                 |
 | `interruptMode`        | enum    | `immediate`     | `immediate`, `wait`.                                                                                    |
+| `composer.historyScope` | enum | `all` | `all`, `session`. Up/Down recalls all sessions by default, or only the current saved conversation, including before resume/restart. |
 | `doubleEscapeAction`   | enum    | `rewind`          | `rewind`, `tree`, `none`: open the rewind selector, open the session tree, or do nothing. |
 | `autoResume`           | boolean | `false`         | Auto-resume the most recent session in the cwd.                                                         |
 | `plan.enabled`         | boolean | `true`          | Enable plan mode.                                                                                       |
@@ -903,6 +904,10 @@ The `cost` segment shows recorded session costs. For an active provider/model wi
 | `startup.showSplash` | boolean | `false` | Show the full setup animation on ordinary interactive startup without rerunning setup. |
 | `startup.changelogMode` | enum | `summary` | `summary`, `expanded`, `hidden`: choose startup release-note presentation. |
 | `startup.setupWizard` | boolean | `true` | Show newly added onboarding steps once per setup version. |
+
+Choose **Interaction → Input → Prompt History Scope** in `/settings`, or run `omp config set composer.historyScope session`. Switch back with `omp config set composer.historyScope all`. This changes submitted-prompt recall, not history search or prediction. Cleared drafts remain local to the current conversation and process, including after a fork.
+
+Interactive submissions, positional CLI prompts, and print-mode prompts retain their original spelling. Older conversations recover human-authored prompts and user-invoked skill commands from their saved journal when available; skill commands are recalled without their expanded bodies. Recovered prompts retain their journal order, and database recovery preserves readable conversation ownership. Original text that was never saved cannot be reconstructed.
 
 ### Providers and services
 

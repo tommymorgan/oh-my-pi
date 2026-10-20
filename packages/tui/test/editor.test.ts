@@ -166,6 +166,40 @@ describe("Editor component", () => {
 			expect(reopened.getText()).toBe("submitted earlier");
 		});
 
+		it("preserves active and cleared paste drafts across a same-owner history reload but drops foreign drafts", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const persisted: string[] = [];
+			const storage = {
+				add: async (prompt: string) => {
+					persisted.push(prompt);
+				},
+				getRecent: () => [{ prompt: "eligible submitted prompt" }],
+			};
+			editor.setHistoryStorage(storage);
+			const cleared = "cleared payload ".repeat(120);
+			const active = "active payload ".repeat(120);
+			editor.handleInput("\x1b[200~" + cleared + "\x1b[201~");
+			editor.rememberDraft();
+			editor.setText("");
+			editor.clearPasteState();
+			editor.handleInput("\x1b[200~" + active + "\x1b[201~");
+			editor.setHistoryStorage(storage, { preserveDrafts: true });
+			expect(editor.getExpandedText()).toBe(active);
+			editor.setText("");
+			editor.clearPasteState();
+			editor.handleInput("\x1b[A");
+			expect(editor.getExpandedText()).toBe(cleared);
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("eligible submitted prompt");
+			expect(persisted).toEqual([]);
+			editor.setHistoryStorage(storage);
+			editor.setText("");
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("eligible submitted prompt");
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("eligible submitted prompt");
+		});
+
 		it("does nothing on Up arrow when history is empty", () => {
 			const editor = new Editor(defaultEditorTheme);
 

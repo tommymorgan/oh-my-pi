@@ -138,7 +138,8 @@ import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
 import { syncTextPrediction, textPredictionBackend } from "../predict/client";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
-import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { operatorTitleText, USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
@@ -344,6 +345,7 @@ import { materializeImageChipLinks, UiHelpers } from "./utils/ui-helpers";
 import {
 	askTimeoutMs,
 	cfgAutocompleteMaxVisible,
+	cfgComposerHistoryScope,
 	cfgComposerPredictions,
 	cfgComposerShape,
 	cfgComposerTokenRate,
@@ -429,6 +431,7 @@ const cfgLiveUiSettings = combine({
 	"spelling.autocomplete": cfgSpellingAutocomplete,
 	"spelling.autocorrect": cfgSpellingAutocorrect,
 	"composer.shape": cfgComposerShape,
+	"composer.historyScope": cfgComposerHistoryScope,
 	"tui.vimMode": cfgTuiVimMode,
 	"tui.vimModeDisplay": cfgTuiVimModeDisplay,
 	"display.pinnedAgents": cfgDisplayPinnedAgents,
@@ -1192,6 +1195,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	keybindings: KeybindingsManager;
 	agent: Agent;
 	historyStorage?: HistoryStorage;
+	#historySessionId?: string;
 
 	/** Canonical composer shared by cold prepaint and the session-aware runtime. */
 	readonly composer: Composer;
@@ -1904,8 +1908,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		setWordPredictionHost(textPredictionBackend);
 		try {
 			this.historyStorage = HistoryStorage.open();
-			this.editor.setHistoryStorage(this.historyStorage);
 			this.historyStorage.setSessionResolver(() => this.sessionManager.getSessionId());
+			this.#configurePromptHistory();
 			// The prediction daemon learns from history.db; nudge it once each prompt is durable.
 			this.historyStorage.setAddListener(syncTextPrediction);
 			this.historyStorage.setErrorListener(() => {
@@ -3552,6 +3556,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.updateEditorBorderColor();
 		}
 		if (any("composer.shape")) this.syncComposerShape();
+		if (any("composer.historyScope")) this.#configurePromptHistory();
 		if (any("tui.vimMode", "tui.vimModeDisplay")) this.#applyVimModeSetting();
 		if (any("display.pinnedAgents")) this.applyPinnedAgentsSetting();
 		if (any("display.subagentLivePreview")) {
@@ -4915,8 +4920,42 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
+	/** Bind recall to the saved conversation without changing shared search. */
+	#configurePromptHistory(): void {
+		const storage = this.historyStorage;
+		if (!storage) return;
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		storage.restoreSession(
+			sessionId,
+			function* () {
+				for (const entry of manager.getEntries()) {
+					const message =
+						entry.type === "message"
+							? entry.message
+							: entry.type === "custom_message"
+								? customMessageEntryMessage(entry)
+								: undefined;
+					const prompt = message && operatorTitleText(message);
+					if (prompt) yield { prompt, created_at: Math.floor(Date.parse(entry.timestamp) / 1000) };
+				}
+			},
+			manager.getCwd(),
+		);
+		const sessionOnly = cfgComposerHistoryScope.get(this.settings) === "session";
+		this.editor.setHistoryStorage(
+			{
+				add: (prompt, cwd) => storage.add(prompt, cwd),
+				getRecent: limit => storage.getRecent(limit, sessionOnly ? { sessionId } : {}),
+			},
+			{ preserveDrafts: this.#historySessionId === sessionId },
+		);
+		this.#historySessionId = sessionId;
+	}
+
 	/** Reconcile mode state from session entries on resume/switch. */
 	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
+		this.#configurePromptHistory();
 		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
 		this.#vibeScopeSuspendedForSwitch = false;
 		this.#guidedGoalInterviewActive = false;
@@ -7444,9 +7483,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setEditor(nextEditor);
 		this.syncComposerShape();
 		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
-		if (this.historyStorage) {
-			nextEditor.setHistoryStorage(this.historyStorage);
-		}
+		this.#configurePromptHistory();
 		nextEditor.setText(previousText);
 
 		this.editorContainer.clear();
@@ -8074,6 +8111,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#cleanseController.dispose();
 		}
 		await this.#commandController.handleForkCommand(placement);
+		// Whole-session forks preserve live modes rather than running the resume
+		// reconciler, but their new saved identity still owns a separate draft history.
+		if (this.#historySessionId !== this.sessionManager.getSessionId()) this.#configurePromptHistory();
 	}
 
 	async handleMoveCommand(targetPath?: string): Promise<void> {

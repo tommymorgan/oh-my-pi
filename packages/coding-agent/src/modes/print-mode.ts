@@ -13,6 +13,7 @@ import type { MCPManager } from "../mcp/manager";
 import { resolveMCPTimeoutMs } from "../mcp/timeout";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
+import { recordPromptHistory } from "../session/history-storage";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
 import {
@@ -281,7 +282,17 @@ async function runPrintModeCore(
 	if (!strictMCPFailure && initialMessage !== undefined) {
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
+		await logger.time("print:prompt:initial", () =>
+			session.prompt(initialMessage, {
+				images: initialImages,
+				onPromptAdmitted: () =>
+					recordPromptHistory(
+						initialMessage,
+						session.sessionManager.getCwd(),
+						session.sessionManager.getSessionId(),
+					),
+			}),
+		);
 	}
 
 	// Send remaining messages
@@ -289,7 +300,12 @@ async function runPrintModeCore(
 		for (const message of messages) {
 			writeTextWorkingIndicator();
 			if (mode === "text") session.setTextOutputCommitted(false);
-			await logger.time("print:prompt:next", () => session.prompt(message));
+			await logger.time("print:prompt:next", () =>
+				session.prompt(message, {
+					onPromptAdmitted: () =>
+						recordPromptHistory(message, session.sessionManager.getCwd(), session.sessionManager.getSessionId()),
+				}),
+			);
 		}
 	}
 

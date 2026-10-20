@@ -103,6 +103,7 @@ import {
 	loadSessionExtensions,
 	resolvePrewalkTarget,
 } from "./sdk";
+import { recordPromptHistory } from "./session/history-storage";
 import type { AgentSession } from "./session/agent-session";
 import { createAuthStorageSettingsSync, describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
@@ -800,7 +801,16 @@ async function runInteractiveMode(
 			// before this dispatch runs (the composer accepts input as soon as the
 			// first turn starts): the CLI message queues into that turn instead of
 			// dying with AgentBusyError.
-			await session.prompt(initialMessage, { images: initialImages, streamingBehavior: "steer" });
+			await session.prompt(initialMessage, {
+				images: initialImages,
+				streamingBehavior: "steer",
+				onPromptAdmitted: () =>
+					recordPromptHistory(
+						initialMessage,
+						session.sessionManager.getCwd(),
+						session.sessionManager.getSessionId(),
+					),
+			});
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
@@ -810,7 +820,11 @@ async function runInteractiveMode(
 	for (const message of initialMessages) {
 		try {
 			using _keepalive = new EventLoopKeepalive();
-			await session.prompt(message, { streamingBehavior: "steer" });
+			await session.prompt(message, {
+				streamingBehavior: "steer",
+				onPromptAdmitted: () =>
+					recordPromptHistory(message, session.sessionManager.getCwd(), session.sessionManager.getSessionId()),
+			});
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);

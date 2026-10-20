@@ -113,6 +113,104 @@ describe("HistoryStorage session linkage", () => {
 			verify.close();
 		}
 	});
+
+	it("retains each session's repeated prompt and local recency after reopening", async () => {
+		const { storage, dbPath } = await freshStorage();
+		await storage.add("shared prompt", "/a", "a");
+		await storage.add("only alpha", "/a", "a");
+		await storage.add("shared prompt", "/b", "b");
+		await storage.add("only beta", "/b", "b");
+		HistoryStorage.close();
+		const previousMembershipSchema = new Database(dbPath);
+		const columns = previousMembershipSchema.query<{ name: string }, []>("PRAGMA table_info(history_sessions)").all();
+		if (columns.some(column => column.name === "journal_order")) {
+			previousMembershipSchema.run("ALTER TABLE history_sessions DROP COLUMN journal_order");
+		}
+		previousMembershipSchema.close();
+		const reopened = HistoryStorage.open(dbPath);
+
+		expect(reopened.getRecent(10, { sessionId: "a" }).map(entry => entry.prompt)).toEqual([
+			"only alpha",
+			"shared prompt",
+		]);
+		expect(reopened.getRecent(10, { sessionId: "b" }).map(entry => entry.prompt)).toEqual([
+			"only beta",
+			"shared prompt",
+		]);
+		expect(reopened.getRecent(10).find(entry => entry.prompt === "shared prompt")).toMatchObject({
+			sessionId: "b",
+			useCount: 2,
+		});
+		expect(reopened.getRecent(10, { sessionId: "" })).toEqual([]);
+	});
+
+	it("orders recovered journal prompts across migration seeds without rewriting later submissions", async () => {
+		tempDir = TempDir.createSync("@omp-history-session-mixed-seeds-");
+		const dbPath = tempDir.join("history.db");
+		const legacy = new Database(dbPath);
+		legacy.run(`
+CREATE TABLE history (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, prompt TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL, cwd TEXT, session_id TEXT, use_count INTEGER NOT NULL DEFAULT 1
+);
+INSERT INTO history (prompt, created_at, cwd, session_id, use_count) VALUES
+	('shared', 101, '/b', 'b', 8),
+	('alpha', 100, '/a', 'a', 4);
+		`);
+		legacy.close();
+		const storage = HistoryStorage.open(dbPath);
+		await storage.add("later genuine", "/a/new", "a");
+		await storage.add("later genuine", "/a/new", "a");
+		const sameSecond = new Database(dbPath);
+		sameSecond.run("UPDATE history_sessions SET created_at = 100 WHERE prompt = 'later genuine'");
+		sameSecond.close();
+		const before = storage.getRecent(10);
+		storage.restoreSession(
+			"a",
+			() => [
+				{ prompt: "shared", created_at: 100 },
+				{ prompt: "alpha", created_at: 100 },
+				{ prompt: "later genuine", created_at: 100 },
+			],
+			"/a/journal",
+		);
+		const expected = storage.getRecent(10, { sessionId: "a" });
+		expect(expected.map(entry => entry.prompt)).toEqual(["later genuine", "alpha", "shared"]);
+		expect(expected[0]).toMatchObject({ cwd: "/a/new", useCount: 2 });
+		expect(expected[1]).toMatchObject({ created_at: 100, cwd: "/a", useCount: 4 });
+		expect(expected[2]).toMatchObject({ created_at: 100, cwd: "/a/journal", useCount: 1 });
+		expect(storage.getRecent(10)).toEqual(before);
+		expect(storage.search("shared", 10)[0]).toMatchObject({ sessionId: "b", useCount: 8 });
+		HistoryStorage.close();
+		const reopened = HistoryStorage.open(dbPath);
+		expect(reopened.getRecent(10, { sessionId: "a" })).toEqual(expected);
+		reopened.restoreSession("a", () => [{ prompt: "alpha", created_at: 500 }]);
+		expect(reopened.getRecent(10, { sessionId: "a" })).toEqual(expected);
+	});
+
+	it("recovers overwritten pre-feature prompts once without changing shared search or raw command recall", async () => {
+		const { storage, dbPath } = await freshStorage();
+		await storage.add("shared old prompt", "/b", "b");
+		storage.restoreSession("a", () => [
+			{ prompt: "shared old prompt", created_at: 1 },
+			{ prompt: "alpha only", created_at: 1 },
+			{ prompt: "shared old prompt", created_at: 1 },
+		]);
+		expect(storage.getRecent(10, { sessionId: "a" }).map(entry => entry.prompt)).toEqual([
+			"shared old prompt",
+			"alpha only",
+		]);
+		expect(storage.search("alpha", 10)).toEqual([]);
+		await storage.add("/skill:example original arguments", "/a", "a");
+		HistoryStorage.close();
+		const reopened = HistoryStorage.open(dbPath);
+		reopened.restoreSession("a", () => [{ prompt: "expanded journal body", created_at: 2 }]);
+		expect(reopened.getRecent(10, { sessionId: "a" }).map(entry => entry.prompt)).toEqual([
+			"/skill:example original arguments",
+			"shared old prompt",
+			"alpha only",
+		]);
+	});
 });
 
 describe("HistoryStorage.matchingSessionIds", () => {
