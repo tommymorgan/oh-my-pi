@@ -31,7 +31,7 @@ export interface HistoryEntry {
 export interface HistoryFilter {
 	/** Exact project working directory of the prompt's latest submission. */
 	cwd?: string;
-	/** Exact conversation id; recent reads retain membership across resubmissions. */
+	/** Prompts remain in this conversation's recall history even when submitted again in another conversation. */
 	sessionId?: string;
 }
 
@@ -132,9 +132,9 @@ export class HistoryStorage {
 
 	// Prepared statements
 	#upsertRowStmt: Statement;
-	#recentStmt: Statement;
+	#recentStmt: Statement<HistoryRow, [string | null, string | null, number]>;
 	#searchStmt: Statement;
-	#sessionRecentStmt: Statement;
+	#sessionRecentStmt: Statement<HistoryRow, [string | null, string | null, number]>;
 	#sessionUpsertStmt: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
@@ -395,7 +395,7 @@ UPDATE history_sessions SET journal_order = ?4
 
 		try {
 			const statement = filter.sessionId === undefined ? this.#recentStmt : this.#sessionRecentStmt;
-			const rows = statement.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
+			const rows = statement.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit);
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });

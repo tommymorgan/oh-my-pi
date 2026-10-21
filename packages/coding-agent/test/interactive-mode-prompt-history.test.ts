@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
@@ -31,9 +32,8 @@ describe("InteractiveMode conversation recall", () => {
 		storage = HistoryStorage.open(tempDir.join("history.db"));
 		vi.spyOn(HistoryStorage, "open").mockReturnValue(storage);
 		authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-		const registry = new ModelRegistry(authStorage);
-		const model = registry.find("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected claude-sonnet-4-5 in registry");
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const model = createMockModel();
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager: SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions")),

@@ -166,7 +166,7 @@ describe("Editor component", () => {
 			expect(reopened.getText()).toBe("submitted earlier");
 		});
 
-		it("preserves active and cleared paste drafts across a same-owner history reload but drops foreign drafts", () => {
+		it("preserves active and cleared paste drafts when requested and discards them on a non-preserving history reload", () => {
 			const editor = new Editor(defaultEditorTheme);
 			const persisted: string[] = [];
 			const storage = {

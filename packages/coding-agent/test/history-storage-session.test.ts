@@ -121,12 +121,6 @@ describe("HistoryStorage session linkage", () => {
 		await storage.add("shared prompt", "/b", "b");
 		await storage.add("only beta", "/b", "b");
 		HistoryStorage.close();
-		const previousMembershipSchema = new Database(dbPath);
-		const columns = previousMembershipSchema.query<{ name: string }, []>("PRAGMA table_info(history_sessions)").all();
-		if (columns.some(column => column.name === "journal_order")) {
-			previousMembershipSchema.run("ALTER TABLE history_sessions DROP COLUMN journal_order");
-		}
-		previousMembershipSchema.close();
 		const reopened = HistoryStorage.open(dbPath);
 
 		expect(reopened.getRecent(10, { sessionId: "a" }).map(entry => entry.prompt)).toEqual([

@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added `Editor.setHistoryStorage(..., { preserveDrafts: true })` to refresh submitted history without losing locally cleared drafts or their paste payloads
-
 ### Fixed
 
 - Fixed unmanaged stdout/stderr and inherited subprocess diagnostics corrupting the interactive viewport on Unix; diagnostics stay in the process log while rendering, resize, handoff, and shutdown retain terminal ownership ([#16159](https://github.com/can1357/oh-my-pi/pull/16159) by [@tommymorgan](https://github.com/tommymorgan)).
